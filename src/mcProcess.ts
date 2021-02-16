@@ -1,226 +1,203 @@
-import { spawn } from "child_process";
+import { EventEmitter } from "events"
+import { spawn} from "child_process";
 import { config } from "./config";
-import { dateToText } from "./time";
 import { ncp } from "ncp";
 import * as fs from "fs";
+import * as recorder from "./recorder";
+import * as moment from "moment";
 
-//----------------------------------------------------------------------------------------------------------------------
+class MinecraftProcess extends EventEmitter {
+  private runningFlag = false;
+  private mcp;
+  private currentCommand: string = null;
+  private returnMap: Map<string, RegExp> = new Map();
 
-enum IOType {
-  stdin = "stdin",
-  stdout = "stdout",
-  stderr = "stderr",
-}
+  constructor() {
+    super();
+    this.mcp = this.startMinecraftServer();
+    // 添加可执行命令以及能匹配结果的正则表达式
+    this.returnMap.set("fill", new RegExp("filled"))
+  }
 
-type IODataItem = {
-  index: number;
-  type: IOType;
-  data: string;
-  time: Date;
-};
-
-class IODataPool {
-  private items: IODataItem[] = [];
-
-  append(item: IODataItem) {
-    this.items.push(item);
-    //log
-    console.log(
-      `[${dateToText(item.time)}][${item.type}] ${item.data.replace(
-        /\r?\n/g,
-        "\\n"
-      )}`
-    );
-
-    //limit to 128 item
-    if (this.items.length > 128) {
-      this.items.shift();
+  /**
+   * 向命令行中输入mc操作命令，控制命令（例如stop）不要使用此方法
+   * @param command
+   */
+  runCommand(command: string) {
+    let commandType = command.split(" ")[0];
+    if (this.currentCommand == null && this.returnMap.has(commandType)) {
+      this.currentCommand = commandType;
+      this.mcp.stdin.write(command + "\n");
+      return true;
     }
+    return false;
   }
 
-  getAll() {
-    return this.items;
+  getStatus() {
+    return this.runningFlag;
   }
 
-  getStdin() {
-    return this.items.filter((value) => value.type === IOType.stdin);
+  restart() {
+    this.mcp = this.startMinecraftServer();
   }
 
-  getStdout() {
-    return this.items.filter((value) => value.type === IOType.stdout);
-  }
-
-  getStderr() {
-    return this.items.filter((value) => value.type === IOType.stderr);
-  }
-}
-
-class ProcessData {
-  isRunning = false;
-  dataPool: IODataPool = new IODataPool();
-  indexCounter = 0;
-
-  appendStdin(data: string) {
-    this.append(data, IOType.stdin);
-  }
-
-  appendStdout(data: string) {
-    this.append(data, IOType.stdout);
-  }
-
-  appendStderr(data: string) {
-    this.append(data, IOType.stderr);
-  }
-
-  append(data: string, type: IOType) {
-    const index = ++this.indexCounter;
-    this.dataPool.append({
-      index,
-      data,
-      type,
-      time: new Date(),
-    });
-  }
-}
-
-const processData = new ProcessData();
-
-//----------------------------------------------------------------------------------------------------------------------
-
-let runningFlag = false;
-
-function startMinecraftServer() {
-  console.log("starting minecraft server...");
-  const _mcp = spawn(config.mc.path, {
-    detached: true,
-  });
-  _mcp.stdout.on("data", (data: Buffer) => {
-    processData.appendStdout(data.toString());
-  });
-  _mcp.stderr.on("data", (data: Buffer) => {
-    processData.appendStderr(data.toString());
-  });
-  _mcp.on("exit", () => {
-    console.log("exit");
-    runningFlag = false;
-  });
-  _mcp.on("close", () => {
-    console.log("close");
-    runningFlag = false;
-  });
-  _mcp.on("error", (e) => {
-    console.log("error", e);
-    runningFlag = false;
-  });
-  console.log("minecraft server started");
-  runningFlag = true;
-
-  //listen Ctrl-C
-  process.on("SIGINT", () => {
-    console.log("stopping mc server...");
-    _mcp.on("exit", () => {
-      console.log("mc server stopped.");
-      process.exit(0);
-    });
-    _mcp.stdin.write("stop\n");
-  });
-  return _mcp;
-}
-
-let mcProcess = startMinecraftServer();
-
-//----------------------------------------------------------------------------------------------------------------------
-
-export const getStdout = () => {
-  return processData.dataPool.getAll();
-};
-
-export const sendToStdin = (data: string) => {
-  processData.appendStdin(data);
-  mcProcess.stdin.write(data + "\n");
-};
-
-export const backup = () =>
-  new Promise<string>((resolve, reject) => {
-    console.log("backup...");
-    mcProcess.on("close", () => {
-      const datePostfix = dateToText(new Date()).toString().replace(":", "-");
-      const backupName = `${config.mc.levelName}-${datePostfix}`;
-
-      ncp(
-        `${config.mc.worlds}${config.mc.levelName}`,
-        `${config.mc.worlds}${backupName}`,
-        (error) => {
-          if (error) {
-            console.log(`backup error:${error}`);
-          } else {
-            console.log("backup success.");
-            resolve(backupName);
-            mcProcess = startMinecraftServer();
+  backup() {
+    return new Promise<string>((resolve, reject) => {
+      console.log("backup...");
+      this.mcp.on("close", () => {
+        const datePostfix = moment(new Date()).format("YYYY-MM-DD HH:mm:ss").replace(":", "-");
+        const backupName = `${config.mc.levelName}-${datePostfix}`;
+        ncp(
+          `${config.mc.worlds}${config.mc.levelName}`,
+          `${config.mc.worlds}${backupName}`,
+          (error) => {
+            if (error) {
+              console.log(`backup error:${error}`);
+              reject(`${error}`);
+            } else {
+              console.log("backup success.");
+              this.restart();
+              resolve(backupName);
+            }
           }
-        }
-      );
+        );
+      });
+      this.mcp.stdin.write("stop\n");
     });
-    mcProcess.stdin.write("stop\n");
+  }
+
+  rollback(backupName: string) {
+    return new Promise<void>((resolve, reject) => {
+      if (fs.readdirSync(`${config.mc.worlds}`).includes(backupName)) {
+        mcProcess.on("close", () => {
+          //save current game
+          ncp(
+            `${config.mc.worlds}${config.mc.levelName}`,
+            `${config.mc.worlds}${config.mc.levelName}.old`,
+            (error) => {
+              if (error) {
+                console.log(`error while rollback:${error}`);
+                reject(error);
+              } else {
+                //remove old game
+                fs.rmSync(`${config.mc.worlds}${config.mc.levelName}`, {
+                  recursive: true,
+                });
+                //copy backup version
+                ncp(
+                  `${config.mc.worlds}${backupName}`,
+                  `${config.mc.worlds}${config.mc.levelName}`,
+                  (error) => {
+                    if (error) {
+                      console.log(`rollback error:${error}`);
+                      reject(error);
+                    } else {
+                      console.log("rollback success.");
+                      this.restart();
+                      resolve();
+                    }
+                  }
+                );
+              }
+            }
+          );
+        });
+        this.mcp.stdin.write("stop\n");
+      }
+    });
+  }
+
+  private startMinecraftServer() {
+    console.log("starting minecraft server...");
+    const _mcp = spawn(config.mc.path, {
+      detached: true,
+    });
+
+    _mcp.stdout.on("data", (data: Buffer) => {
+      // 先判断是否出现语法错误
+      if (this.currentCommand && data.toString().search("error")) {
+        this.emit("commandError", data.toString());
+      }
+      // 再判断是否为命令运行结束
+      else if (this.currentCommand && this.returnMap.get(this.currentCommand).test(data.toString())) {
+        this.emit("commandSuccess", data.toString());
+      }
+      recorder.append(data.toString(), recorder.DataType.STDOUT);
+    });
+
+    _mcp.stderr.on("data", (data: Buffer) => {
+      recorder.append(data.toString(), recorder.DataType.STDERR);
+    });
+
+    _mcp.on("exit", () => {
+      console.log("exit");
+      this.runningFlag = false;
+    });
+
+    _mcp.on("close", () => {
+      console.log("close");
+      this.runningFlag = false;
+    });
+
+    _mcp.on("error", (e) => {
+      console.log("error", e);
+      this.runningFlag = false;
+    });
+
+    console.log("minecraft server started");
+    this.runningFlag = true;
+
+    //listen Ctrl-C
+    process.on("SIGINT", () => {
+      console.log("stopping mc server...");
+      _mcp.on("exit", () => {
+        console.log("mc server stopped.");
+        process.exit(0);
+      });
+      _mcp.stdin.write("stop\n");
+    });
+    return _mcp;
+  }
+
+}
+let mcProcess = new MinecraftProcess();
+
+//----------------------------------------------------------------------------------------------------------------------
+
+export const runCommand = (data: string) =>
+  new Promise((resolve, reject) => {
+    if (mcProcess.runCommand(data)) {
+      mcProcess.once("commandSuccess", () => {
+        resolve(true);
+      });
+      mcProcess.once("commandError", () => {
+        resolve(false);
+      });
+    } else {
+      resolve(false);
+    }
   });
+
+export const backup = () => mcProcess.backup();
 
 export const getBackupList = () => {
   return fs.readdirSync(`${config.mc.worlds}`);
 };
 
-export const rollback = (backupName: string) =>
-  new Promise<void>((resolve, reject) => {
-    if (fs.readdirSync(`${config.mc.worlds}`).includes(backupName)) {
-      mcProcess.on("close", () => {
-        //save current game
-        ncp(
-          `${config.mc.worlds}${config.mc.levelName}`,
-          `${config.mc.worlds}${config.mc.levelName}.old`,
-          (error) => {
-            if (error) {
-              console.log(`error while rollback:${error}`);
-              reject(error);
-            } else {
-              //remove old game
-              fs.rmSync(`${config.mc.worlds}${config.mc.levelName}`, {
-                recursive: true,
-              });
-              //copy backup version
-              ncp(
-                `${config.mc.worlds}${backupName}`,
-                `${config.mc.worlds}${config.mc.levelName}`,
-
-                (error) => {
-                  if (error) {
-                    console.log(`rollback error:${error}`);
-                    reject(error);
-                  } else {
-                    console.log("rollback success.");
-                    mcProcess = startMinecraftServer();
-                    resolve();
-                  }
-                }
-              );
-            }
-          }
-        );
-      });
-      mcProcess.stdin.write("stop\n");
-    }
-  });
+export const rollback = (backupName: string) => mcProcess.rollback(backupName);
 
 // 检查服务器运行状态
 export const checkStatus = () => {
-  return runningFlag;
+  return mcProcess.getStatus();
 }
 
 // 重启服务器
 // 设置force参数可以强制重启
 export const restartServer = (force = false) =>
   new Promise<void>((resolve, reject) => {
-    if (!(!force && runningFlag)) {
-      mcProcess = startMinecraftServer();
-      if (runningFlag) {
+    if (force || ! mcProcess.getStatus()) {
+      mcProcess.restart();
+      if (mcProcess.getStatus()) {
         resolve();
       } else {
         reject("Server restart failed!");

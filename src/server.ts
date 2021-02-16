@@ -1,16 +1,16 @@
 import { config } from "./config";
 import * as express from "express";
 import * as cookieParser from "cookie-parser";
+import * as recorder from "./recorder";
 
 import {
   backup,
   getBackupList,
-  getStdout,
   rollback,
-  sendToStdin,
   checkStatus,
   restartServer
 } from "./mcProcess";
+import { commandHandle } from "./praser";
 
 const server = express();
 
@@ -72,14 +72,14 @@ server.get("/mc/stdout", (req, res) => {
     ""
   );*/
   return res.send({
-    stdout: getStdout(),
+    stdout: recorder.getData(),
   });
 });
 
 server.post("/mc/stdin", (req, res) => {
   const toSend = req?.body?.stdin;
   if (toSend) {
-    sendToStdin(toSend);
+    commandHandle(toSend);
   }
   res.send({
     result: "ok",
